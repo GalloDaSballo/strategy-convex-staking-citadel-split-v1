@@ -2,23 +2,30 @@ from brownie import (
     accounts,
     interface,
     Controller,
-    SettV3,
-    MyStrategy,
+    SettV4,
+    StrategyConvexStakingOptimizer,
+    Wei,
 )
 from config import (
     BADGER_DEV_MULTISIG,
-    CURVE_POOL_CONFIG,
-    PID,
-    WANT,
-    FEES,
-    WANT_CONFIG,
+    BADGER_TREE,
 )
 from dotmap import DotMap
 import pytest
+from rich.console import Console
+import time
+from helpers.time import days
+from helpers.test.test_utils import generate_curve_LP_assets
+
+console = Console()
 
 
-@pytest.fixture
-def deployed():
+@pytest.fixture(autouse=True)
+def isolation(fn_isolation):
+    pass
+
+
+def deploy(sett_config):
     """
     Deploys, vault, controller and strats and wires them up for you to test
     """
@@ -33,9 +40,9 @@ def deployed():
     controller = Controller.deploy({"from": deployer})
     controller.initialize(BADGER_DEV_MULTISIG, strategist, keeper, BADGER_DEV_MULTISIG)
 
-    sett = SettV3.deploy({"from": deployer})
-    sett.initialize(
-        WANT,
+    # Get Sett arguments:
+    args = [
+        sett_config.params.want,
         controller,
         BADGER_DEV_MULTISIG,
         keeper,
@@ -43,113 +50,68 @@ def deployed():
         False,
         "prefix",
         "PREFIX",
-    )
+    ]
+
+    sett = SettV4.deploy({"from": deployer})
+    sett.initialize(*args)
 
     sett.unpause({"from": governance})
-    controller.setVault(WANT, sett)
+    controller.setVault(sett.token(), sett)
 
-    ## TODO: Add guest list once we find compatible, tested, contract
-    # guestList = VipCappedGuestListWrapperUpgradeable.deploy({"from": deployer})
-    # guestList.initialize(sett, {"from": deployer})
-    # guestList.setGuests([deployer], [True])
-    # guestList.setUserDepositCap(100000000)
-    # sett.setGuestList(guestList, {"from": governance})
-
-    ## Start up Strategy
-    strategy = MyStrategy.deploy({"from": deployer})
-    strategy.initialize(
-        governance,
+    # Get Strategy arguments:
+    args = [
+        BADGER_DEV_MULTISIG,
         strategist,
         controller,
         keeper,
         guardian,
-        WANT_CONFIG,
-        PID,
-        FEES,
-        CURVE_POOL_CONFIG,
-    )
+        [
+            sett_config.params.want,
+            BADGER_TREE,
+            sett_config.params.cvxCrvHelperVault,
+        ],
+        sett_config.params.pid,
+        [
+            sett_config.params.performanceFeeGovernance,
+            sett_config.params.performanceFeeStrategist,
+            sett_config.params.withdrawalFee,
+        ],
+    ]
 
-    ## Tool that verifies bytecode (run independently) <- Webapp for anyone to verify
+    ## Start up Strategy
+    strategy = StrategyConvexStakingOptimizer.deploy({"from": deployer})
+    strategy.initialize(*args)
+
+
+    ## Grant contract access from strategy to cvxCRV Helper Vault
+    cvxCrvHelperVault = SettV4.at(strategy.cvxCrvHelperVault())
+    cvxCrvHelperGov = accounts.at(cvxCrvHelperVault.governance(), force=True)
+    cvxCrvHelperVault.approveContractAccess(strategy.address, {"from": cvxCrvHelperGov})
+
+    ## Reset rewards if they are set to expire within the next 4 days or are expired already
+    rewardsPool = interface.IBaseRewardsPool(strategy.baseRewardsPool())
+    if rewardsPool.periodFinish() - int(time.time()) < days(4):
+        booster = interface.IBooster(strategy.booster())
+        booster.earmarkRewards(sett_config.params.pid, {"from": deployer})
+        console.print("[green]BaseRewardsPool expired or expiring soon - it was reset![/green]")
 
     ## Set up tokens
-    want = interface.IERC20(WANT)
+    want = interface.IERC20(strategy.want())
 
     ## Wire up Controller to Strart
     ## In testing will pass, but on live it will fail
-    controller.approveStrategy(WANT, strategy, {"from": governance})
-    controller.setStrategy(WANT, strategy, {"from": deployer})
+    controller.approveStrategy(want, strategy, {"from": governance})
+    controller.setStrategy(want, strategy, {"from": deployer})
 
-    # Transfer test assets to deployer
-    whale = accounts.at("0x647481c033A4A2E816175cE115a0804adf793891", force=True) # RenCRV whale
-    want.transfer(deployer.address, want.balanceOf(whale.address), {"from": whale}) # Transfer 80% of whale's want balance
+    # Generate test want for user
+    generate_curve_LP_assets(deployer, Wei("10 ether"), sett_config)
 
     assert want.balanceOf(deployer.address) > 0
 
     return DotMap(
         deployer=deployer,
         controller=controller,
-        vault=sett,
         sett=sett,
         strategy=strategy,
-        # guestList=guestList,
         want=want,
     )
-
-
-## Contracts ##
-
-
-@pytest.fixture
-def vault(deployed):
-    return deployed.vault
-
-
-@pytest.fixture
-def sett(deployed):
-    return deployed.sett
-
-
-@pytest.fixture
-def controller(deployed):
-    return deployed.controller
-
-
-@pytest.fixture
-def strategy(deployed):
-    return deployed.strategy
-
-
-## Tokens ##
-
-
-@pytest.fixture
-def want(deployed):
-    return deployed.want
-
-
-@pytest.fixture
-def tokens():
-    return [WANT]
-
-
-## Accounts ##
-
-
-@pytest.fixture
-def deployer(deployed):
-    return deployed.deployer
-
-
-@pytest.fixture
-def strategist(strategy):
-    return accounts.at(strategy.strategist(), force=True)
-
-
-@pytest.fixture
-def settKeeper(vault):
-    return accounts.at(vault.keeper(), force=True)
-
-
-@pytest.fixture
-def strategyKeeper(strategy):
-    return accounts.at(strategy.keeper(), force=True)
