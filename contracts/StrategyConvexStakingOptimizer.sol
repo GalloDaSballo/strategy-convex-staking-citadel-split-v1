@@ -29,50 +29,11 @@ import "deps/libraries/UniswapSwapper.sol";
 import "deps/libraries/TokenSwapPathRegistry.sol";
 
 /*
-    === Deposit ===
-    Deposit & Stake underlying asset into appropriate convex vault (deposit + stake is atomic)
+    Forked from:
+    https://github.com/sajanrajdev/strategy-convex-staking-optimizer
 
-    === Tend ===
+    Citadel Version:
 
-    == Stage 1: Realize gains from all positions ==
-    Harvest CRV and CVX from core vault rewards pool
-    Harvest CVX and SUSHI from CVX/ETH LP
-    Harvest CVX and SUSHI from cvxCRV/CRV LP
-
-    Harvested coins:
-    CRV
-    CVX
-    SUSHI
-
-    == Stage 2: Deposit all gains into staked positions ==
-    Zap all CRV -> cvxCRV/CRV
-    Zap all CVX -> CVX/ETH
-    Stake Sushi
-
-    Position coins:
-    cvxCRV/CRV
-    CVX/ETH
-    xSushi
-
-    These position coins will be distributed on harvest
-
-
-    Changelog:
-
-    V1.1
-    * Implemented the _exchange function from the CurveSwapper library to perform the CRV -> cvxCRV and vice versa
-    swaps through curve instead of Sushiswap.
-    * It now swaps 3CRV into CRV instead of cvxCRV. If enough is aquired, it swaps this CRV for wBTC directly and, if not,
-    it swaps some cvxCRV for CRV to compensate.
-    * Removed some unused functions and variables such as the `addExtraRewardsToken` and `removeExtraRewardsToken` functions
-    as well as the obsolete swapping paths.
-    V1.2 
-    * Removed unused Code
-    * Changed to purchase bveCVX via Curve Factory Pool
-    V1.3
-    * Remove auto compounding
-    * Added harvest threshold for 3Crv
-    * Removed unused variables
 */
 contract StrategyConvexStakingOptimizer is
     BaseStrategy,
@@ -84,6 +45,12 @@ contract StrategyConvexStakingOptimizer is
     using AddressUpgradeable for address;
     using SafeMathUpgradeable for uint256;
     using EnumerableSetUpgradeable for EnumerableSetUpgradeable.AddressSet;
+
+    // == CITADEL SETTINS ==//
+    uint256 public constant MAX_BPS = 10_000;
+    uint256 public constant AUTOCOMPOUND_BPS = 9_000; // 90%
+    uint256 public constant EMIT_BPS = 1_000; // 10% // Sell and send to locker
+
 
     // ===== Token Registry =====
     address public constant wbtc = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
@@ -185,10 +152,9 @@ contract StrategyConvexStakingOptimizer is
     struct TendData {
         uint256 crvTended;
         uint256 cvxTended;
-        uint256 cvxCrvTended;
     }
 
-    event TendState(uint256 crvTended, uint256 cvxTended, uint256 cvxCrvTended);
+    event TendState(uint256 crvTended, uint256 cvxTended);
 
     function initialize(
         address _governance,
@@ -365,48 +331,19 @@ contract StrategyConvexStakingOptimizer is
 
         TendData memory tendData;
 
-        // 1. Harvest gains from positions
+        // 1. Claim CVX and CRV
         _tendGainsFromPositions();
 
         // Track harvested coins, before conversion
         tendData.crvTended = crvToken.balanceOf(address(this));
 
-        // 2. Convert CRV -> cvxCRV
-        if (tendData.crvTended > 0) {
-            uint256 minCvxCrvOut =
-                tendData
-                    .crvTended
-                    .mul(MAX_FEE.sub(stableSwapSlippageTolerance))
-                    .div(MAX_FEE);
-            _exchange(
-                crv,
-                cvxCrv,
-                tendData.crvTended,
-                minCvxCrvOut,
-                crvCvxCrvPoolIndex,
-                true
-            );
-        }
-
         // Track harvested + converted coins
-        tendData.cvxCrvTended = cvxCrvToken.balanceOf(address(this));
         tendData.cvxTended = cvxToken.balanceOf(address(this));
-
-        // 3. Stake all cvxCRV
-        if (tendData.cvxCrvTended > 0) {
-            cvxCrvRewardsPool.stake(tendData.cvxCrvTended);
-        }
-
-        // 4. Stake all CVX
-        if (tendData.cvxTended > 0) {
-            cvxRewardsPool.stake(cvxToken.balanceOf(address(this)));
-        }
 
         emit Tend(0);
         emit TendState(
             tendData.crvTended,
             tendData.cvxTended,
-            tendData.cvxCrvTended
         );
         return tendData;
     }
@@ -418,181 +355,26 @@ contract StrategyConvexStakingOptimizer is
 
         uint256 totalWantBefore = balanceOf();
 
-        // TODO: Harvest details still under constructuion. It's being designed to optimize yield while still allowing on-demand access to profits for users.
+        // Claim All rewards just like in tend
+        _tendGainsFromPositions();
 
-        // 1. Withdraw accrued rewards from staking positions (claim unclaimed positions as well)
-        baseRewardsPool.getReward(address(this), true);
+        // Process CRV
 
-        uint256 cvxCrvRewardsPoolBalance =
-            cvxCrvRewardsPool.balanceOf(address(this));
-        if (cvxCrvRewardsPoolBalance > 0) {
-            cvxCrvRewardsPool.withdraw(cvxCrvRewardsPoolBalance, true);
-        }
+        // Ask Curve, Ask UniV3, 
 
-        uint256 cvxRewardsPoolBalance = cvxRewardsPool.balanceOf(address(this));
-        if (cvxRewardsPoolBalance > 0) {
-            cvxRewardsPool.withdraw(cvxRewardsPoolBalance, true);
-        }
+        // Process CVX
 
+        // Check if cvxCRV
+        // If cvxCRV Proces
+
+        // Auto-Compound
+
+        // Emit Rest
+
+        harvestData.crvHarvested = crvToken.balanceOf(address(this));
         harvestData.cvxCrvHarvested = cvxCrvToken.balanceOf(address(this));
         harvestData.cvxHarvested = cvxToken.balanceOf(address(this));
 
-        // 2. Convert 3CRV -> CRV via USDC
-        uint256 threeCrvBalance = threeCrvToken.balanceOf(address(this));
-        if (threeCrvBalance > minThreeCrvHarvest) {
-            _remove_liquidity_one_coin(threeCrvSwap, threeCrvBalance, 1, 0);
-            uint256 usdcBalance = usdcToken.balanceOf(address(this));
-            if (usdcBalance > 0) {
-                _swapExactTokensForTokens(
-                    sushiswap,
-                    usdc,
-                    usdcBalance,
-                    getTokenSwapPath(usdc, crv)
-                );
-            }
-        }
-
-        // 3. Convert CRV -> cvxCRV
-        uint256 crvBalance = crvToken.balanceOf(address(this));
-        if (crvBalance > 0) {
-            uint256 minCvxCrvOut =
-                crvBalance.mul(MAX_FEE.sub(stableSwapSlippageTolerance)).div(
-                    MAX_FEE
-                );
-            _exchange(
-                crv,
-                cvxCrv,
-                crvBalance,
-                minCvxCrvOut,
-                crvCvxCrvPoolIndex,
-                true
-            );
-        }
-
-        // 4. Deposit cvxCRV rewards into helper vault and distribute
-        if (harvestData.cvxCrvHarvested > 0) {
-            uint256 cvxCrvToDistribute = cvxCrvToken.balanceOf(address(this));
-
-            if (performanceFeeGovernance > 0) {
-                uint256 cvxCrvToGovernance =
-                    cvxCrvToDistribute.mul(performanceFeeGovernance).div(
-                        MAX_FEE
-                    );
-                cvxCrvHelperVault.depositFor(
-                    IController(controller).rewards(),
-                    cvxCrvToGovernance
-                );
-                emit PerformanceFeeGovernance(
-                    IController(controller).rewards(),
-                    cvxCrv,
-                    cvxCrvToGovernance,
-                    block.number,
-                    block.timestamp
-                );
-            }
-
-            if (performanceFeeStrategist > 0) {
-                uint256 cvxCrvToStrategist =
-                    cvxCrvToDistribute.mul(performanceFeeStrategist).div(
-                        MAX_FEE
-                    );
-                cvxCrvHelperVault.depositFor(strategist, cvxCrvToStrategist);
-                emit PerformanceFeeStrategist(
-                    strategist,
-                    cvxCrv,
-                    cvxCrvToStrategist,
-                    block.number,
-                    block.timestamp
-                );
-            }
-
-            // TODO: [Optimization] Allow contract to circumvent blockLock to dedup deposit operations
-
-            uint256 treeHelperVaultBefore =
-                cvxCrvHelperVault.balanceOf(badgerTree);
-
-            // Deposit remaining to tree after taking fees.
-            uint256 cvxCrvToTree = cvxCrvToken.balanceOf(address(this));
-            cvxCrvHelperVault.depositFor(badgerTree, cvxCrvToTree);
-
-            uint256 treeHelperVaultAfter =
-                cvxCrvHelperVault.balanceOf(badgerTree);
-            uint256 treeVaultPositionGained =
-                treeHelperVaultAfter.sub(treeHelperVaultBefore);
-
-            emit TreeDistribution(
-                address(cvxCrvHelperVault),
-                treeVaultPositionGained,
-                block.number,
-                block.timestamp
-            );
-        }
-
-        // 5. Swap CVX for bveCVX and distribute
-        if (harvestData.cvxHarvested > 0) {
-            uint256 cvxToDistribute = cvxToken.balanceOf(address(this));
-            uint256 minbveCVXOut =
-                cvxToDistribute
-                    .mul(MAX_FEE.sub(stableSwapSlippageTolerance))
-                    .div(MAX_FEE);
-            // Get the bveCVX here
-            _exchange(
-                address(cvxToken),
-                address(bveCVX),
-                cvxToDistribute,
-                minbveCVXOut,
-                0,
-                true
-            );
-
-            uint256 bveCVXAmount = bveCVX.balanceOf(address(this));
-
-            if (performanceFeeGovernance > 0) {
-                uint256 bveCvxToGovernance =
-                    bveCVXAmount.mul(performanceFeeGovernance).div(MAX_FEE);
-                bveCVX.safeTransfer(
-                    IController(controller).rewards(),
-                    bveCvxToGovernance
-                );
-                emit PerformanceFeeGovernance(
-                    IController(controller).rewards(),
-                    address(bveCVX),
-                    bveCvxToGovernance,
-                    block.number,
-                    block.timestamp
-                );
-            }
-
-            if (performanceFeeStrategist > 0) {
-                uint256 bveCvxToStrategist =
-                    bveCVXAmount.mul(performanceFeeStrategist).div(MAX_FEE);
-                bveCVX.safeTransfer(strategist, bveCvxToStrategist);
-                emit PerformanceFeeStrategist(
-                    strategist,
-                    address(bveCVX),
-                    bveCvxToStrategist,
-                    block.number,
-                    block.timestamp
-                );
-            }
-
-            uint256 treeHelperVaultBefore = bveCVX.balanceOf(badgerTree);
-
-            // Deposit remaining to tree after taking fees.
-            uint256 bveCvxToTree = bveCVX.balanceOf(address(this));
-            bveCVX.safeTransfer(badgerTree, bveCvxToTree);
-
-            uint256 treeHelperVaultAfter = bveCVX.balanceOf(badgerTree);
-            uint256 treeVaultPositionGained =
-                treeHelperVaultAfter.sub(treeHelperVaultBefore);
-
-            emit TreeDistribution(
-                address(bveCVX),
-                treeVaultPositionGained,
-                block.number,
-                block.timestamp
-            );
-        }
 
         uint256 totalWantAfter = balanceOf();
         require(totalWantAfter >= totalWantBefore, "want-decreased");
